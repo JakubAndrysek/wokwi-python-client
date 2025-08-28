@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 import asyncio
+import contextlib
 import json
 import os
 import warnings
@@ -109,7 +110,7 @@ class Transport:
         finally:
             del self._response_futures[msg_id]
 
-    async def _background_recv(self, throw_error: bool = True) -> None:
+    async def _background_recv(self, throw_error: bool = True) -> None:  # noqa: PLR0912
         try:
             while not self._closed and self._ws is not None:
                 msg: IncomingMessage = await self._recv()
@@ -118,24 +119,46 @@ class Transport:
                     await self._dispatch_event(resp_msg_event)
                 elif msg["type"] == MSG_TYPE_RESPONSE:
                     resp_msg_resp = cast(ResponseMessage, msg)
-                    future = self._response_futures.get(resp_msg_resp["id"])
+                    # FIX: be defensive about the id type (ensure string key)
+                    resp_id = str(resp_msg_resp.get("id"))
+                    future = self._response_futures.get(resp_id)
                     if future is None or future.done():
                         continue
                     future.set_result(resp_msg_resp)
-        except (websockets.ConnectionClosed, asyncio.CancelledError):
-            pass
-        except Exception as e:
-            warnings.warn(f"Background recv error: {e}", RuntimeWarning)
-
-            if throw_error:
-                self._closed = True
-                # Cancel all pending response futures
-                for future in self._response_futures.values():
-                    if not future.done():
-                        future.set_exception(e)
+        except asyncio.CancelledError:
+            # Expected during shutdown via close(); let close() swallow it.
+            raise
+        except websockets.ConnectionClosed as e:
+            # FIX: Previously swallowed -> pending requests would hang forever.
+            # Mark transport closed, fail all pending futures, and optionally re-raise.
+            self._closed = True
+            for future in list(self._response_futures.values()):
+                if not future.done():
+                    future.set_exception(e)
+            with contextlib.suppress(Exception):
                 if self._ws:
                     await self._ws.close()
+            if throw_error:
                 raise
+        except Exception as e:
+            warnings.warn(f"Background recv error: {e}", RuntimeWarning)
+            if throw_error:
+                self._closed = True
+                # Fail all pending response futures so callers don't hang.
+                for future in list(self._response_futures.values()):
+                    if not future.done():
+                        future.set_exception(e)
+                with contextlib.suppress(Exception):
+                    if self._ws:
+                        await self._ws.close()
+                raise
+        finally:
+            # FIX: If we exit the loop for any reason and transport is closed,
+            # make extra sure no future is left unresolved.
+            if self._closed:
+                for future in list(self._response_futures.values()):
+                    if not future.done():
+                        future.set_exception(RuntimeError("Transport receive loop exited"))
 
     async def _recv(self) -> IncomingMessage:
         if self._ws is None:
