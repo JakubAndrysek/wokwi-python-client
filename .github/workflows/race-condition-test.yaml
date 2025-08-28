@@ -1,0 +1,58 @@
+name: Race Condition Test
+
+on:
+    push:
+    workflow_dispatch:
+
+jobs:
+    race-condition-test:
+        runs-on: ubuntu-24.04
+        strategy:
+            fail-fast: false
+            matrix:
+                test: [
+                    "examples.hello_esp32.main",
+                    "examples.hello_esp32_sync.main",
+                    "examples.micropython_esp32.main"
+                ]
+
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - run: pip install hatch
+            - name: Run a Wokwi CI server
+              uses: wokwi/wokwi-ci-server-action@v1
+            - name: Run race condition test for 30 minutes
+              if: env.WOKWI_CLI_TOKEN != ''
+              env:
+                  WOKWI_CLI_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN }}
+                  WOKWI_SLEEP_TIME: "5"  # Shorter sleep time for more iterations
+              run: |
+                echo "Starting race condition test for ${{ matrix.test }}"
+                echo "Test will run for 30 minutes..."
+
+                start_time=$(date +%s)
+                end_time=$((start_time + 1800))  # 30 minutes = 1800 seconds
+                iteration=1
+
+                while [ $(date +%s) -lt $end_time ]; do
+                  echo "=== Iteration $iteration for ${{ matrix.test }} ==="
+                  echo "Time: $(date)"
+
+                  if ! timeout 120 hatch run python -m ${{ matrix.test }}; then
+                    echo "ERROR: Test failed on iteration $iteration"
+                    echo "Failure time: $(date)"
+                    exit 1
+                  fi
+
+                  echo "Iteration $iteration completed successfully"
+                  iteration=$((iteration + 1))
+
+                  # Small delay between iterations
+                  sleep 2
+                done
+
+                echo "Race condition test completed successfully after $((iteration - 1)) iterations"
+                echo "Total runtime: 30 minutes"
